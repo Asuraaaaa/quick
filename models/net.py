@@ -5,9 +5,23 @@ from typing import Dict
 import torch
 from torch import nn
 
-from .backbones import CNNBackbone, TransformerBackbone
-from .fusion import SingleLayerFusion
+from .backbones import TransformerBackbone, build_backbone
+from .fusion import SingleLayerFusion, SingleLayerFusion_DCA, SingleLayerFusion_CA
+from torch.autograd import Function
 
+class GradientReverseFunction(Function):
+    @staticmethod
+    def forward(ctx, x, lambda_grl):
+        ctx.lambda_grl = lambda_grl
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambda_grl * grad_output, None
+
+
+def grad_reverse(x, lambda_grl=1.0):
+    return GradientReverseFunction.apply(x, lambda_grl)
 
 class FaultDiagnosisNet(nn.Module):
     def __init__(self, cfg: Dict):
@@ -16,30 +30,42 @@ class FaultDiagnosisNet(nn.Module):
         model_cfg = cfg["model"]
         self.input_mode = data_cfg["input_mode"]
         self.backbone_name = model_cfg["backbone"]["name"]
-
-        # project to common token dim=192 for transformer path
+        self.lambda_grl = model_cfg["lambda_grl"]
+        # project to common token dim=129 for transformer path
         if self.input_mode == "two_channel":
-            self.input_proj = nn.Linear(63 * 2, 192)
+            self.input_proj = nn.Linear(63 * 2, 129)
         elif self.input_mode == "split_dual":
-            self.input_proj = nn.Linear(63 * 2, 192)
+            self.input_proj = nn.Linear(63 * 2, 129)
         elif self.input_mode == "concat":
-            self.input_proj = nn.Linear(126, 192)
+            self.input_proj = nn.Linear(126, 128)
         else:
             raise ValueError(f"Unsupported input_mode: {self.input_mode}")
 
         fusion_cfg = model_cfg["fusion"]
-        self.fusion = None
-        if fusion_cfg["enabled"]:
+        if self.backbone_name == "transformer_dca": 
+            self.fusion = SingleLayerFusion_DCA(
+                d_model=fusion_cfg["d_model"],
+                ffn_hidden=fusion_cfg["dim_feedforward"],
+                n_head=fusion_cfg["nhead"],
+                drop_prob=fusion_cfg["dropout"]
+            )
+        if self.backbone_name == "transformer_ca":
+            self.fusion = SingleLayerFusion_CA(
+                d_model=fusion_cfg["d_model"],
+                ffn_hidden=fusion_cfg["dim_feedforward"],
+                n_head=fusion_cfg["nhead"],
+                drop_prob=fusion_cfg["dropout"]
+            )
+        if self.backbone_name == "transformer":
             self.fusion = SingleLayerFusion(
                 d_model=fusion_cfg["d_model"],
-                nhead=fusion_cfg["nhead"],
-                dim_feedforward=fusion_cfg["dim_feedforward"],
-                dropout=fusion_cfg["dropout"],
-                batch_first=fusion_cfg["batch_first"],
+                ffn_hidden=fusion_cfg["dim_feedforward"],
+                n_head=fusion_cfg["nhead"],
+                drop_prob=fusion_cfg["dropout"]
             )
 
         bb_cfg = model_cfg["backbone"]
-        if self.backbone_name == "transformer":
+        if self.backbone_name == "transformer" or self.backbone_name == "transformer_dca" or self.backbone_name == "transformer_ca":
             t_cfg = bb_cfg["transformer"]
             self.backbone = TransformerBackbone(
                 d_model=t_cfg["d_model"],
@@ -49,71 +75,237 @@ class FaultDiagnosisNet(nn.Module):
                 dropout=bb_cfg["dropout"],
             )
             feat_dim = t_cfg["d_model"]
-        elif self.backbone_name == "cnn":
-            self.cnn_adapt = nn.Conv2d(2, 2, kernel_size=1)
-            self.backbone = CNNBackbone(in_channels=2, base_channels=bb_cfg["cnn"]["base_channels"])
-            feat_dim = self.backbone.out_dim
+            self.transformer_head = nn.Sequential(nn.BatchNorm1d(feat_dim*129),
+                                              nn.ReLU(inplace=True),
+                                              nn.Linear(feat_dim*129, feat_dim))
+        elif self.backbone_name == "mobilenet_v2":
+            self.backbone = build_backbone("mobilenet_v2", pretrained=False, out_dim=256)
+            feat_dim = 256
+        elif self.backbone_name == "mobilenet_v3_small":
+            self.backbone = build_backbone("mobilenet_v3_small", pretrained=False, out_dim=256)
+            feat_dim = 256
+        elif self.backbone_name == "shufflenet_v2_x1_5":
+            self.backbone = build_backbone("shufflenet_v2_x1_5", pretrained=False, out_dim=256)
+            feat_dim = 256
+        elif self.backbone_name == "efficientnet_b0":
+            self.backbone = build_backbone("efficientnet_b0", pretrained=False, out_dim=256)
+            feat_dim = 256
+        elif self.backbone_name == "convnextv2_atto":
+            self.backbone = build_backbone("convnextv2_atto", pretrained=False, out_dim=256)
+            feat_dim = 256
+        elif self.backbone_name == "mobilevit_xs":
+            self.backbone = build_backbone('mobilevit_xs', pretrained=False, out_dim=256)
+            feat_dim = 256
         else:
             raise ValueError(f"Unsupported backbone: {self.backbone_name}")
 
         hidden1, hidden2 = model_cfg["classifier"]["hidden_dims"]
         drop = model_cfg["classifier"]["dropout"]
-        self.classifier = nn.Sequential(
+        
+        self.classifier_head = nn.Sequential(
             nn.Linear(feat_dim, hidden1),
             nn.ReLU(inplace=True),
+            nn.BatchNorm1d(hidden1),
             nn.Dropout(drop),
-            nn.Linear(hidden1, hidden2),
+            nn.Linear(hidden1, hidden2))
+        self.classifier = nn.Sequential(
             nn.ReLU(inplace=True),
+            nn.BatchNorm1d(hidden2),
             nn.Dropout(drop),
-            nn.Linear(hidden2, data_cfg["num_classes"]),
+            nn.Linear(hidden2, data_cfg["num_classes"])
         )
 
-        self.phys_head_in = nn.Sequential(nn.Linear(feat_dim, hidden2), nn.ReLU(inplace=True), nn.Linear(hidden2, 1))
-        self.phys_head_out = nn.Sequential(nn.Linear(feat_dim, hidden2), nn.ReLU(inplace=True), nn.Linear(hidden2, 1))
+        self.domain_classifier_head = nn.Sequential(
+            nn.Linear(feat_dim, hidden1),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(hidden1),
+            nn.Dropout(drop),
+            nn.Linear(hidden1, hidden2))
+        self.domain_classifier = nn.Sequential(
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(hidden2),
+            nn.Dropout(drop),
+            nn.Linear(hidden2, 6)
+        )
 
-    def _prepare_tokens(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        if self.input_mode == "two_channel":
-            x = batch["x"]  # [B,2,192,63]
-            b, _, t, f = x.shape
-            x = x.permute(0, 2, 1, 3).reshape(b, t, 2 * f)  # [B,192,126]
-            return self.input_proj(x)  # [B,192,192]
+        # self.phys_head_in_1 = nn.Linear(feat_dim, hidden2)
+        # self.relu1 = nn.ReLU(inplace=True)
+        # self.phys_head_in_2 = nn.Linear(hidden2, 1)
 
-        if self.input_mode == "split_dual":
-            x1 = batch["x1"]
-            x2 = batch["x2"]
-            x = torch.cat([x1, x2], dim=-1)  # [B,192,126]
-            return self.input_proj(x)
+        # self.phys_head_out_1 = nn.Linear(feat_dim, hidden2)
+        # self.relu2 = nn.ReLU(inplace=True)
+        # self.phys_head_out_2 = nn.Linear(hidden2, 1)
 
-        x = batch["x"]  # [B,192,126]
-        return self.input_proj(x)
-
-    def _prepare_cnn(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        if self.input_mode == "two_channel":
-            return batch["x"]
-        if self.input_mode == "split_dual":
-            x = torch.stack([batch["x1"], batch["x2"]], dim=1)  # [B,2,192,63]
-            return x
-        x = batch["x"]
-        x = x.reshape(x.shape[0], 2, 192, 63)
-        return x
-
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        if self.backbone_name == "transformer":
-            tokens = self._prepare_tokens(batch)
-            if self.fusion is not None:
-                tokens = self.fusion(tokens)
+    def forward(self, batch: Dict[str, torch.Tensor], lambda_grl=None) -> Dict[str, torch.Tensor]:
+        if self.backbone_name == "transformer_dca":
+            x1, x2 = batch["x1"], batch["x2"]
+            tokens = self.fusion(x1, x2)
             feat = self.backbone(tokens)
-        else:
-            x = self._prepare_cnn(batch)
-            x = self.cnn_adapt(x)
-            feat = self.backbone(x)
+            feat = feat.flatten(start_dim=1)
+            feat = self.transformer_head(feat)
+            feat1 = self.classifier_head(feat)
+            logits = self.classifier(feat1)
+            feat_rev = grad_reverse(feat, self.lambda_grl)
+            domain_feat1 = self.domain_classifier_head(feat_rev)
+            domains = self.domain_classifier(domain_feat1)
+            phi_in_feat = torch.tensor(0.0)
+            phi_in_pred = torch.tensor(0.0)
+            phi_out_feat = torch.tensor(0.0)
+            phi_out_pred = torch.tensor(0.0)
+            # phi_in_feat = self.phys_head_in_1(feat)
+            # phi_in_pred = self.phys_head_in_2(self.relu1(phi_in_feat)).squeeze(-1)
+            # phi_out_feat = self.phys_head_out_1(feat)
+            # phi_out_pred = self.phys_head_out_2(self.relu1(phi_out_feat)).squeeze(-1)
+        
+        if self.backbone_name == "transformer_ca":
+            x1, x2 = batch["x1"], batch["x2"]
+            tokens = self.fusion(x1, x2)
+            feat = self.backbone(tokens)
+            feat = feat.flatten(start_dim=1)
+            feat = self.transformer_head(feat)
+            feat1 = self.classifier_head(feat)
+            logits = self.classifier(feat1)
+            feat_rev = grad_reverse(feat, self.lambda_grl)
+            domain_feat1 = self.domain_classifier_head(feat_rev)
+            domains = self.domain_classifier(domain_feat1)
+            phi_in_feat = torch.tensor(0.0)
+            phi_in_pred = torch.tensor(0.0)
+            phi_out_feat = torch.tensor(0.0)
+            phi_out_pred = torch.tensor(0.0)
+            # phi_in_feat = self.phys_head_in_1(feat)
+            # phi_in_pred = self.phys_head_in_2(self.relu1(phi_in_feat)).squeeze(-1)
+            # phi_out_feat = self.phys_head_out_1(feat)
+            # phi_out_pred = self.phys_head_out_2(self.relu1(phi_out_feat)).squeeze(-1)
 
-        logits = self.classifier(feat)
-        phi_in_pred = self.phys_head_in(feat).squeeze(-1)
-        phi_out_pred = self.phys_head_out(feat).squeeze(-1)
+        if self.backbone_name == "transformer":
+            x = batch["x"]
+            x_in = self.input_proj(x)
+            tokens = self.fusion(x_in)
+            feat = self.backbone(tokens)
+            feat = feat.flatten(start_dim=1)
+            feat = self.transformer_head(feat)
+            feat1 = self.classifier_head(feat)
+            logits = self.classifier(feat1)
+            feat_rev = grad_reverse(feat, self.lambda_grl)
+            domain_feat1 = self.domain_classifier_head(feat_rev)
+            domains = self.domain_classifier(domain_feat1)
+            phi_in_feat = torch.tensor(0.0)
+            phi_in_pred = torch.tensor(0.0)
+            phi_out_feat = torch.tensor(0.0)
+            phi_out_pred = torch.tensor(0.0)
+            # phi_in_feat = self.phys_head_in_1(feat)
+            # phi_in_pred = self.phys_head_in_2(self.relu1(phi_in_feat)).squeeze(-1)
+            # phi_out_feat = self.phys_head_out_1(feat)
+            # phi_out_pred = self.phys_head_out_2(self.relu1(phi_out_feat)).squeeze(-1)
+        
+        if self.backbone_name == "mobilenet_v2":
+            x = batch["x"]
+            feat = self.backbone(x)
+            feat1 = self.classifier_head(feat)
+            logits = self.classifier(feat1)
+            feat_rev = grad_reverse(feat, self.lambda_grl)
+            domain_feat1 = self.domain_classifier_head(feat_rev)
+            domains = self.domain_classifier(domain_feat1)
+            phi_in_feat = torch.tensor(0.0)
+            phi_in_pred = torch.tensor(0.0)
+            phi_out_feat = torch.tensor(0.0)
+            phi_out_pred = torch.tensor(0.0)
+            # phi_in_feat = self.phys_head_in_1(feat)
+            # phi_in_pred = self.phys_head_in_2(self.relu1(phi_in_feat)).squeeze(-1)
+            # phi_out_feat = self.phys_head_out_1(feat)
+            # phi_out_pred = self.phys_head_out_2(self.relu1(phi_out_feat)).squeeze(-1)
+        
+        if self.backbone_name == "mobilenet_v3_small":
+            x = batch["x"]
+            feat = self.backbone(x)
+            feat1 = self.classifier_head(feat)
+            logits = self.classifier(feat1)
+            feat_rev = grad_reverse(feat, self.lambda_grl)
+            domain_feat1 = self.domain_classifier_head(feat_rev)
+            domains = self.domain_classifier(domain_feat1)
+            phi_in_feat = torch.tensor(0.0)
+            phi_in_pred = torch.tensor(0.0)
+            phi_out_feat = torch.tensor(0.0)
+            phi_out_pred = torch.tensor(0.0)
+            # phi_in_feat = self.phys_head_in_1(feat)
+            # phi_in_pred = self.phys_head_in_2(self.relu1(phi_in_feat)).squeeze(-1)
+            # phi_out_feat = self.phys_head_out_1(feat)
+            # phi_out_pred = self.phys_head_out_2(self.relu1(phi_out_feat)).squeeze(-1)
+        
+        if self.backbone_name == "shufflenet_v2_x1_5":
+            x = batch["x"]
+            feat = self.backbone(x)
+            feat1 = self.classifier_head(feat)
+            logits = self.classifier(feat1)
+            feat_rev = grad_reverse(feat, self.lambda_grl)
+            domain_feat1 = self.domain_classifier_head(feat_rev)
+            domains = self.domain_classifier(domain_feat1)
+            phi_in_feat = torch.tensor(0.0)
+            phi_in_pred = torch.tensor(0.0)
+            phi_out_feat = torch.tensor(0.0)
+            phi_out_pred = torch.tensor(0.0)
+            # phi_in_feat = self.phys_head_in_1(feat)
+            # phi_in_pred = self.phys_head_in_2(self.relu1(phi_in_feat)).squeeze(-1)
+            # phi_out_feat = self.phys_head_out_1(feat)
+            # phi_out_pred = self.phys_head_out_2(self.relu1(phi_out_feat)).squeeze(-1)
+        
+        if self.backbone_name == "efficientnet_b0":
+            x = batch["x"]
+            feat = self.backbone(x)
+            feat1 = self.classifier_head(feat)
+            logits = self.classifier(feat1)
+            feat_rev = grad_reverse(feat, self.lambda_grl)
+            domain_feat1 = self.domain_classifier_head(feat_rev)
+            domains = self.domain_classifier(domain_feat1)
+            phi_in_feat = torch.tensor(0.0)
+            phi_in_pred = torch.tensor(0.0)
+            phi_out_feat = torch.tensor(0.0)
+            phi_out_pred = torch.tensor(0.0)
+            # phi_in_feat = self.phys_head_in_1(feat)
+            # phi_in_pred = self.phys_head_in_2(self.relu1(phi_in_feat)).squeeze(-1)
+            # phi_out_feat = self.phys_head_out_1(feat)
+            # phi_out_pred = self.phys_head_out_2(self.relu1(phi_out_feat)).squeeze(-1)
+        
+        if self.backbone_name == "convnextv2_atto":
+            x = batch["x"]
+            feat = self.backbone(x)
+            feat1 = self.classifier_head(feat)
+            logits = self.classifier(feat1)
+            feat_rev = grad_reverse(feat, self.lambda_grl)
+            domain_feat1 = self.domain_classifier_head(feat_rev)
+            domains = self.domain_classifier(domain_feat1)
+            phi_in_feat = torch.tensor(0.0)
+            phi_in_pred = torch.tensor(0.0)
+            phi_out_feat = torch.tensor(0.0)
+            phi_out_pred = torch.tensor(0.0)
+            # phi_in_feat = self.phys_head_in_1(feat)
+            # phi_in_pred = self.phys_head_in_2(self.relu1(phi_in_feat)).squeeze(-1)
+            # phi_out_feat = self.phys_head_out_1(feat)
+            # phi_out_pred = self.phys_head_out_2(self.relu1(phi_out_feat)).squeeze(-1)
+            
+        if self.backbone_name == "mobilevit_xs":
+            x = batch["x"]
+            feat = self.backbone(x)
+            feat1 = self.classifier_head(feat)
+            logits = self.classifier(feat1)
+            feat_rev = grad_reverse(feat, self.lambda_grl)
+            domain_feat1 = self.domain_classifier_head(feat_rev)
+            domains = self.domain_classifier(domain_feat1)
+            phi_in_feat = torch.tensor(0.0)
+            phi_in_pred = torch.tensor(0.0)
+            phi_out_feat = torch.tensor(0.0)
+            phi_out_pred = torch.tensor(0.0)
+            # phi_in_feat = self.phys_head_in_1(feat)
+            # phi_in_pred = self.phys_head_in_2(self.relu1(phi_in_feat)).squeeze(-1)
+            # phi_out_feat = self.phys_head_out_1(feat)
+            # phi_out_pred = self.phys_head_out_2(self.relu1(phi_out_feat)).squeeze(-1)
 
         return {
+            "feat": feat,
             "logits": logits,
+            "domains": domains,
+            "phi_in_feat": phi_in_feat,
             "phi_in_pred": phi_in_pred,
-            "phi_out_pred": phi_out_pred,
+            "phi_out_feat": phi_out_feat,
+            "phi_out_pred": phi_out_pred
         }
