@@ -1,55 +1,70 @@
 seed: 42
-output_dir: outputs/exp_baseline
+output_dir: outputs/transformer7
 
 data:
-  train_csv: data/train.csv
-  val_csv: data/val.csv
-  test_csv: data/test.csv
+  train_csv: /train1/gxc/HSFG/data/trainnew.csv
+  val_csv: /train1/gxc/HSFG/data/valnew.csv
+  test_csv: /train1/gxc/HSFG/data/testnew.csv
   num_classes: 5
-  sample_rate: 1000
-  n_fft: 382
-  win_length: 382
-  hop_length: 26
+  sample_rate: 2000
+  n_fft: 256
+  win_length: 256
+  hop_length: 32
   stft_center: true
   stft_normalized: false
   stft_pad_mode: reflect
-  input_mode: two_channel   # [two_channel, split_dual, concat]
-  batch_size: 32
+  input_mode: concat      # [two_channel, split_dual, concat]
+  batch_size: 256
   num_workers: 4
   pin_memory: true
 
 model:
   fusion:
-    enabled: true
-    d_model: 192
-    nhead: 8
-    dim_feedforward: 384
+    enabled: false
+    d_model: 128
+    nhead: 4
+    dim_feedforward: 256
     dropout: 0.1
-    batch_first: true
+
   backbone:
-    name: transformer        # [transformer, cnn]
+    name: transformer        # [transformer, mobilenet_v2, mobilenet_v3_small, shufflenet_v2_x1_5, efficientnet_b0, convnextv2_atto]
     dropout: 0.1
     transformer:
-      num_layers: 2
-      d_model: 192
-      nhead: 8
-      dim_feedforward: 384
+      num_layers: 7
+      d_model: 128
+      nhead: 4
+      dim_feedforward: 256
       batch_first: true
-    cnn:
-      base_channels: 32
+
   classifier:
-    hidden_dims: [256, 128]
-    dropout: 0.2
+    hidden_dims: [128, 64]
+    dropout: 0.1
+  
+  lambda_grl: 0.5
 
 loss:
-  lambda_in: 0.4
-  lambda_out: 0.4
-  alpha_in: 0.2
-  alpha_out: 0.2
+  lambda_in: 0.1
+  lambda_out: 0.05
+  lambda_domain: 0.2
+  alpha_in: 0.1
+  alpha_out: 0.1
+
+  use_center_consistency: false  # default false true
+  lambda_center: 0.5
+  lambda_center_in: 1.0
+  lambda_center_out: 1.0
+  center_warmup_epochs: 5
+  
+  num_domains: 6
+  center_feat_dim: 64
+  center_distance: "sq_l2"      # "l2", "sq_l2", "l1", "cosine", "smooth_l1" 推荐 cosine 和 sq_l2
+  center_momentum: 0.9
+  center_normalize: true
+  center_reduction: "mean"
 
 optimizer:
   name: adamw
-  lr: 0.0003
+  lr: 0.0002
   weight_decay: 0.0001
 
 scheduler:
