@@ -53,6 +53,7 @@ class FaultDiagnosisDataset(Dataset):
         stft_cfg: STFTConfig,
         input_mode: str = "two_channel",
         root_dir: str | Path | None = None,
+        target_domain_id: int | None = None,
     ) -> None:
         self.csv_path = Path(csv_path)
         self.df = pd.read_csv(self.csv_path)
@@ -60,6 +61,11 @@ class FaultDiagnosisDataset(Dataset):
 
         self.stft_cfg = stft_cfg
         self.input_mode = input_mode
+        # 目标域全局编号（0~5），用于识别 target normal 样本
+        # 若未显式指定，则尝试从当前 CSV 自动推断（适配多油缸轮换 target 训练）。
+        self.target_domain_id = target_domain_id
+        if self.target_domain_id is None:
+            self.target_domain_id = self._infer_target_domain_id()
 
         self.root_dir = Path(root_dir) if root_dir is not None else self.csv_path.parent
         self.window = torch.hann_window(stft_cfg.win_length)
@@ -68,6 +74,30 @@ class FaultDiagnosisDataset(Dataset):
         missing = [c for c in self.REQUIRED_COLUMNS if c not in self.df.columns]
         if missing:
             raise ValueError(f"CSV missing required columns: {missing}")
+
+    def _infer_target_domain_id(self) -> int | None:
+        """
+        从当前 CSV 自动识别 target 域（仅 normal 类）：
+        - 将原始油缸编号映射到全局域编号；
+        - 若某个全局域仅出现 normal 标签，则视为 target 域候选；
+        - 仅在候选唯一时返回该域，否则返回 None。
+        """
+        if "label" not in self.df.columns or "id_cylinder" not in self.df.columns:
+            return None
+
+        df_tmp = self.df[["label", "id_cylinder"]].copy()
+        df_tmp["global_domain"] = df_tmp["id_cylinder"].map(self.GLOBAL_CYLINDER_MAPPING)
+        df_tmp = df_tmp.dropna(subset=["global_domain"])
+
+        target_candidates: List[int] = []
+        for dom_id, group in df_tmp.groupby("global_domain"):
+            labels = set(group["label"].tolist())
+            if labels == {"normal"}:
+                target_candidates.append(int(dom_id))
+
+        if len(target_candidates) == 1:
+            return target_candidates[0]
+        return None
 
     def __len__(self) -> int:
         return len(self.df)
@@ -129,6 +159,13 @@ class FaultDiagnosisDataset(Dataset):
 
         label_id = self.LABEL_MAPPING[row["label"]]
         global_domain = self._map_cylinder_to_global_domain(int(row["id_cylinder"]))
+        is_target_normal = False
+
+        # 若 CSV 已提供显式标记，优先使用；否则按“目标域 + normal 类”规则识别
+        if "is_target_normal" in self.df.columns:
+            is_target_normal = bool(row["is_target_normal"])
+        elif self.target_domain_id is not None:
+            is_target_normal = (global_domain == int(self.target_domain_id)) and (label_id == self.LABEL_MAPPING["normal"])
 
         sample["label"] = torch.tensor(label_id, dtype=torch.long)
 
@@ -140,6 +177,7 @@ class FaultDiagnosisDataset(Dataset):
 
         sample["phi_in"] = torch.tensor(float(row["phi_in"]), dtype=torch.float32)
         sample["phi_out"] = torch.tensor(float(row["phi_out"]), dtype=torch.float32)
+        sample["is_target_normal"] = torch.tensor(is_target_normal, dtype=torch.bool)
         return sample
 
 
@@ -168,6 +206,7 @@ def build_dataloaders(
         "stft_cfg": stft_cfg,
         "input_mode": data_cfg["input_mode"],
         "root_dir": data_cfg.get("root_dir", None),
+        "target_domain_id": data_cfg.get("target_domain_id", None),
     }
 
     train_set = FaultDiagnosisDataset(train_csv, **common)

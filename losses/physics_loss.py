@@ -371,8 +371,29 @@ class MultiTaskPhysicsDANNLoss(nn.Module):
 
         self.mu_in = nn.Parameter(torch.tensor(1.0))
 
+        # 目标域 normal 物理锚定（轻量 running prototype）
+        loss_cfg = cfg.get("loss", {})
+        self.enable_tn_compact = bool(loss_cfg.get("enable_tn_compact", False))
+        self.lambda_tn_compact = float(loss_cfg.get("lambda_tn_compact", 0.0))
+        self.tn_compact_momentum = float(loss_cfg.get("tn_compact_momentum", 0.9))
+        self.tn_compact_eps = 1e-8
+        self.register_buffer("tn_running_proto", torch.zeros(1))
+        self.register_buffer("tn_has_proto", torch.tensor(False, dtype=torch.bool))
+
     def _normalize(self, x: torch.Tensor, min_v: float, max_v: float) -> torch.Tensor:
         return (x - min_v) / (max_v - min_v + self.eps)
+
+    @torch.no_grad()
+    def _update_tn_running_proto(self, batch_proto: torch.Tensor) -> None:
+        if (not self.tn_has_proto.item()) or (self.tn_running_proto.numel() != batch_proto.numel()):
+            self.tn_running_proto = batch_proto.detach().clone()
+            self.tn_has_proto.fill_(True)
+            return
+
+        self.tn_running_proto = (
+            self.tn_compact_momentum * self.tn_running_proto
+            + (1.0 - self.tn_compact_momentum) * batch_proto.detach()
+        )
 
     def forward(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         logits = outputs["logits"]
@@ -409,7 +430,32 @@ class MultiTaskPhysicsDANNLoss(nn.Module):
 
         l_domain = self.domain_ce(domain_logits, domains)
 
-        total = ce_loss + self.lambda_in * l_in + self.lambda_out * l_out + self.lambda_domain * l_domain
+        device = logits.device
+        l_tn_compact = torch.tensor(0.0, device=device)
+
+        if self.enable_tn_compact and self.lambda_tn_compact > 0:
+            feats = outputs.get("feat", None)
+            tn_mask = batch.get("is_target_normal", None)
+            if (feats is not None) and (tn_mask is not None):
+                tn_mask = tn_mask.bool()
+                if tn_mask.any():
+                    tn_feats = feats[tn_mask]  # [N_tn, D]
+                    batch_proto = tn_feats.mean(dim=0)  # [D]
+                    self._update_tn_running_proto(batch_proto)
+
+                    anchor_proto = self.tn_running_proto
+                    if anchor_proto.ndim == 1:
+                        anchor_proto = anchor_proto.unsqueeze(0)
+
+                    l_tn_compact = ((tn_feats - anchor_proto) ** 2).sum(dim=-1).mean()
+
+        total = (
+            ce_loss
+            + self.lambda_in * l_in
+            + self.lambda_out * l_out
+            + self.lambda_domain * l_domain
+            + self.lambda_tn_compact * l_tn_compact
+        )
 
         return {
             "loss": total,
@@ -417,4 +463,5 @@ class MultiTaskPhysicsDANNLoss(nn.Module):
             "l_in": l_in.detach(),
             "l_out": l_out.detach(),
             "l_domain": l_domain.detach(),
+            "l_tn_compact": l_tn_compact.detach(),
         }
