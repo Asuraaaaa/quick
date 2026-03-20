@@ -73,6 +73,7 @@ def run_one_epoch(model, criterion, loader, optimizer, device, cfg, epoch, scale
     total_out = 0.0
     total_center = 0.0
     total_domain = 0.0
+    total_tn_compact = 0.0
 
     all_logits = []
     all_targets = []
@@ -109,8 +110,9 @@ def run_one_epoch(model, criterion, loader, optimizer, device, cfg, epoch, scale
         total_ce += float(loss_dict["ce_loss"].item())
         total_in += float(loss_dict["l_in"].item())
         total_out += float(loss_dict["l_out"].item())
-        total_domain += float(loss_dict["l_domain"].item())
+        total_domain += float(loss_dict.get("l_domain", torch.tensor(0.0, device=device)).item())
         total_center += float(loss_dict.get("l_center", torch.tensor(0.0, device=device)).item())
+        total_tn_compact += float(loss_dict.get("l_tn_compact", torch.tensor(0.0, device=device)).item())
 
         all_logits.append(outputs["logits"].detach())
         all_targets.append(batch["label"].detach())
@@ -129,6 +131,7 @@ def run_one_epoch(model, criterion, loader, optimizer, device, cfg, epoch, scale
         "l_out": total_out / len(loader),
         "l_center": total_center / len(loader),
         "l_domain": total_domain / len(loader),
+        "l_tn_compact": total_tn_compact / len(loader),
         "acc": accuracy(logits, targets),
         "merged_acc": acc_elff(logits, targets),
         "f1": macro_f1(logits, targets, num_classes=num_classes),

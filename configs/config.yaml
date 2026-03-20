@@ -14,6 +14,7 @@ data:
   stft_normalized: false
   stft_pad_mode: reflect
   input_mode: concat      # [two_channel, split_dual, concat]
+  target_domain_id: null  # 目标域全局编号(0~5); null 表示按每个 CSV 自动推断(适配多油缸轮换 target)
   batch_size: 256
   num_workers: 4
   pin_memory: true
@@ -46,6 +47,9 @@ loss:
   lambda_in: 0.1
   lambda_out: 0.05
   lambda_domain: 0.2
+  enable_tn_compact: false
+  lambda_tn_compact: 0.0
+  tn_compact_momentum: 0.9
   alpha_in: 0.1
   alpha_out: 0.1
 
