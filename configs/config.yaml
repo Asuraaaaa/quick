@@ -88,3 +88,16 @@ transfer:
   pretrained_path: ""
   strict: false
   freeze_backbone: false
+
+# 域泛化方法开关：
+# - method: none / coral / mmd / mixstyle
+dg:
+  method: none
+  lambda_dg: 0.1
+  mmd:
+    kernel_mul: 2.0
+    kernel_num: 5
+  mixstyle:
+    enabled: true
+    p: 0.5
+    alpha: 0.1
