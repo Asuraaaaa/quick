@@ -7,6 +7,7 @@ from torch import nn
 
 from .backbones import TransformerBackbone, build_backbone
 from .fusion import SingleLayerFusion, SingleLayerFusion_DCA, SingleLayerFusion_CA
+from .mixstyle import MixStyle
 from torch.autograd import Function
 
 class GradientReverseFunction(Function):
@@ -31,6 +32,14 @@ class FaultDiagnosisNet(nn.Module):
         self.input_mode = data_cfg["input_mode"]
         self.backbone_name = model_cfg["backbone"]["name"]
         self.lambda_grl = model_cfg["lambda_grl"]
+        dg_cfg = cfg.get("dg", {})
+        self.dg_method = str(dg_cfg.get("method", "none")).lower()
+        mix_cfg = dg_cfg.get("mixstyle", {})
+        self.use_mixstyle = self.dg_method == "mixstyle" and bool(mix_cfg.get("enabled", False))
+        self.mixstyle = MixStyle(
+            p=float(mix_cfg.get("p", 0.5)),
+            alpha=float(mix_cfg.get("alpha", 0.1)),
+        )
         # project to common token dim=129 for transformer path
         if self.input_mode == "two_channel":
             self.input_proj = nn.Linear(63 * 2, 129)
@@ -143,6 +152,8 @@ class FaultDiagnosisNet(nn.Module):
             feat = self.backbone(tokens)
             feat = feat.flatten(start_dim=1)
             feat = self.transformer_head(feat)
+            if self.use_mixstyle:
+                feat = self.mixstyle(feat)
             feat1 = self.classifier_head(feat)
             logits = self.classifier(feat1)
             feat_rev = grad_reverse(feat, self.lambda_grl)
@@ -163,6 +174,8 @@ class FaultDiagnosisNet(nn.Module):
             feat = self.backbone(tokens)
             feat = feat.flatten(start_dim=1)
             feat = self.transformer_head(feat)
+            if self.use_mixstyle:
+                feat = self.mixstyle(feat)
             feat1 = self.classifier_head(feat)
             logits = self.classifier(feat1)
             feat_rev = grad_reverse(feat, self.lambda_grl)
@@ -184,6 +197,8 @@ class FaultDiagnosisNet(nn.Module):
             feat = self.backbone(tokens)
             feat = feat.flatten(start_dim=1)
             feat = self.transformer_head(feat)
+            if self.use_mixstyle:
+                feat = self.mixstyle(feat)
             feat1 = self.classifier_head(feat)
             logits = self.classifier(feat1)
             feat_rev = grad_reverse(feat, self.lambda_grl)
@@ -201,6 +216,8 @@ class FaultDiagnosisNet(nn.Module):
         if self.backbone_name == "mobilenet_v2":
             x = batch["x"]
             feat = self.backbone(x)
+            if self.use_mixstyle:
+                feat = self.mixstyle(feat)
             feat1 = self.classifier_head(feat)
             logits = self.classifier(feat1)
             feat_rev = grad_reverse(feat, self.lambda_grl)
@@ -218,6 +235,8 @@ class FaultDiagnosisNet(nn.Module):
         if self.backbone_name == "mobilenet_v3_small":
             x = batch["x"]
             feat = self.backbone(x)
+            if self.use_mixstyle:
+                feat = self.mixstyle(feat)
             feat1 = self.classifier_head(feat)
             logits = self.classifier(feat1)
             feat_rev = grad_reverse(feat, self.lambda_grl)
@@ -235,6 +254,8 @@ class FaultDiagnosisNet(nn.Module):
         if self.backbone_name == "shufflenet_v2_x1_5":
             x = batch["x"]
             feat = self.backbone(x)
+            if self.use_mixstyle:
+                feat = self.mixstyle(feat)
             feat1 = self.classifier_head(feat)
             logits = self.classifier(feat1)
             feat_rev = grad_reverse(feat, self.lambda_grl)
@@ -252,6 +273,8 @@ class FaultDiagnosisNet(nn.Module):
         if self.backbone_name == "efficientnet_b0":
             x = batch["x"]
             feat = self.backbone(x)
+            if self.use_mixstyle:
+                feat = self.mixstyle(feat)
             feat1 = self.classifier_head(feat)
             logits = self.classifier(feat1)
             feat_rev = grad_reverse(feat, self.lambda_grl)
@@ -269,6 +292,8 @@ class FaultDiagnosisNet(nn.Module):
         if self.backbone_name == "convnextv2_atto":
             x = batch["x"]
             feat = self.backbone(x)
+            if self.use_mixstyle:
+                feat = self.mixstyle(feat)
             feat1 = self.classifier_head(feat)
             logits = self.classifier(feat1)
             feat_rev = grad_reverse(feat, self.lambda_grl)
@@ -286,6 +311,8 @@ class FaultDiagnosisNet(nn.Module):
         if self.backbone_name == "mobilevit_xs":
             x = batch["x"]
             feat = self.backbone(x)
+            if self.use_mixstyle:
+                feat = self.mixstyle(feat)
             feat1 = self.classifier_head(feat)
             logits = self.classifier(feat1)
             feat_rev = grad_reverse(feat, self.lambda_grl)

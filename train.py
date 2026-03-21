@@ -18,6 +18,7 @@ from torch.cuda.amp import GradScaler, autocast
 
 from data.dataset import build_dataloaders
 from losses.physics_loss import MultiTaskPhysicsLoss, CELoss, compute_norm_stats_from_csv, MultiTaskPhysicsDANNLoss
+from losses.domain_generalization import coral_loss, mmd_loss
 from utils.visualization import (
     plot_tsne,
     plot_tsne_fused,
@@ -66,6 +67,11 @@ def build_scheduler(cfg: Dict, optimizer: torch.optim.Optimizer):
 
 def run_one_epoch(model, criterion, loader, optimizer, device, cfg, epoch, scaler=None, training=True):
     model.train(training)
+    dg_cfg = cfg.get("dg", {})
+    dg_method = str(dg_cfg.get("method", "none")).lower()
+    lambda_dg = float(dg_cfg.get("lambda_dg", 0.0))
+    mmd_kernel_mul = float(dg_cfg.get("mmd", {}).get("kernel_mul", 2.0))
+    mmd_kernel_num = int(dg_cfg.get("mmd", {}).get("kernel_num", 5))
 
     total_loss = 0.0
     total_ce = 0.0
@@ -74,6 +80,7 @@ def run_one_epoch(model, criterion, loader, optimizer, device, cfg, epoch, scale
     total_center = 0.0
     total_domain = 0.0
     total_tn_compact = 0.0
+    total_dg = 0.0
 
     all_logits = []
     all_targets = []
@@ -91,6 +98,17 @@ def run_one_epoch(model, criterion, loader, optimizer, device, cfg, epoch, scale
             outputs = model(batch)
             loss_dict = criterion(outputs, batch)
             loss = loss_dict["loss"]
+            l_dg = torch.tensor(0.0, device=device)
+
+            # 可选域泛化正则：CORAL / MMD（MixStyle 在模型内部生效）
+            if dg_method == "coral" and lambda_dg > 0.0:
+                l_dg = coral_loss(outputs["feat"], batch["id_cylinder"])
+                loss = loss + lambda_dg * l_dg
+            elif dg_method == "mmd" and lambda_dg > 0.0:
+                l_dg = mmd_loss(outputs["feat"], batch["id_cylinder"], kernel_mul=mmd_kernel_mul, kernel_num=mmd_kernel_num)
+                loss = loss + lambda_dg * l_dg
+
+            loss_dict["l_dg"] = l_dg.detach()
 
         if training:
             if scaler is not None and amp_enabled:
@@ -113,6 +131,7 @@ def run_one_epoch(model, criterion, loader, optimizer, device, cfg, epoch, scale
         total_domain += float(loss_dict.get("l_domain", torch.tensor(0.0, device=device)).item())
         total_center += float(loss_dict.get("l_center", torch.tensor(0.0, device=device)).item())
         total_tn_compact += float(loss_dict.get("l_tn_compact", torch.tensor(0.0, device=device)).item())
+        total_dg += float(loss_dict.get("l_dg", torch.tensor(0.0, device=device)).item())
 
         all_logits.append(outputs["logits"].detach())
         all_targets.append(batch["label"].detach())
@@ -132,6 +151,7 @@ def run_one_epoch(model, criterion, loader, optimizer, device, cfg, epoch, scale
         "l_center": total_center / len(loader),
         "l_domain": total_domain / len(loader),
         "l_tn_compact": total_tn_compact / len(loader),
+        "l_dg": total_dg / len(loader),
         "acc": accuracy(logits, targets),
         "merged_acc": acc_elff(logits, targets),
         "f1": macro_f1(logits, targets, num_classes=num_classes),
